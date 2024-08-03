@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
+import asyncio
 
 from homeassistant.components.cover import ATTR_CURRENT_POSITION
 from homeassistant.components.cover import ATTR_POSITION
@@ -29,11 +30,13 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import slugify
 
-from .const import CONF_ENTITY_SWITCH
-from .const import CONF_TIME_CLOSE
-from .const import CONF_TIME_OPEN
-from .travelcalculator import TravelCalculator
-from .travelcalculator import TravelStatus
+from .const import (
+    CONF_ENTITY_SWITCH,
+    CONF_ENTITY_CONTACT_SENSOR,
+    CONF_TIME_CLOSE,
+    CONF_TIME_OPEN,
+)
+from .travelcalculator import TravelCalculator, TravelStatus
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +80,9 @@ async def async_setup_entry(
     entity_switch = er.async_validate_entity_id(
         registry, config_entry.options[CONF_ENTITY_SWITCH]
     )
+    entity_contact_sensor = er.async_validate_entity_id(
+        registry, config_entry.options.get(CONF_ENTITY_CONTACT_SENSOR)
+    )
 
     async_add_entities(
         [
@@ -86,6 +92,7 @@ async def async_setup_entry(
                 config_entry.options.get(CONF_TIME_CLOSE),
                 config_entry.options.get(CONF_TIME_OPEN),
                 entity_switch,
+                entity_contact_sensor,
             )
         ]
     )
@@ -99,6 +106,7 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         travel_time_down,
         travel_time_up,
         switch_entity_id,
+        contact_sensor_entity_id=None,
     ):
         """Initialize the cover."""
         if not travel_time_down:
@@ -107,13 +115,15 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
         self._travel_time_up = travel_time_up
         self._switch_state = STATE_OFF
         self._switch_entity_id = switch_entity_id
+        self._contact_sensor_entity_id = contact_sensor_entity_id
+        self._contact_sensor_state = None
         self._name = name
         self._attr_unique_id = unique_id
 
         self._unsubscribe_auto_updater = None
 
         self.tc = TravelCalculator(self._travel_time_down, self._travel_time_up)
-        self._last_command = None
+        self._previous_direction = None
 
     async def async_added_to_hass(self):
         """Only cover's position matters."""
@@ -130,39 +140,56 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
             self.tc.set_position(int(old_state.attributes.get(ATTR_CURRENT_POSITION)))
 
     async def _handle_state_changed(self, event):
-        """Process changes in Home Assistant, look if switch is opened
-        manually."""
-        # If switch/light is not the target, skip
-        if event.data.get(ATTR_ENTITY_ID) != self._switch_entity_id:
-            return
+        """Process changes in Home Assistant, look if switch is opened manually."""
+        # If the event is for the switch entity
+        if event.data.get(ATTR_ENTITY_ID) == self._switch_entity_id:
+            new_state = event.data.get("new_state")
+            old_state = event.data.get("old_state")
+            if (
+                new_state is None
+                or old_state is None
+                or new_state.state == old_state.state
+            ):
+                return
 
-        if event.data.get("new_state") is None:
-            return
+            # Update the switch state
+            self._switch_state = new_state.state
 
-        if event.data.get("old_state") is None:
-            return
+            # Set unavailable if the switch becomes unavailable
+            self._attr_available = self._switch_state != STATE_UNAVAILABLE
 
-        if event.data.get("new_state").state == event.data.get("old_state").state:
-            return
+            # Handle new status
+            if self._switch_state == STATE_ON:
+                await self.handle_button_press()
 
-        # Target switch/light
-        if self._switch_state == event.data.get("new_state").state:
-            return
-        self._switch_state = event.data.get("new_state").state
+        # If the event is for the contact sensor entity
+        if event.data.get(ATTR_ENTITY_ID) == self._contact_sensor_entity_id:
+            new_state = event.data.get("new_state")
+            old_state = event.data.get("old_state")
+            if (
+                new_state is None
+                or old_state is None
+                or new_state.state == old_state.state
+            ):
+                return
 
-        # Set unavailable if the switch becomes unavailable
-        self._attr_available = self._switch_state != STATE_UNAVAILABLE
+            # Update the contact sensor state
+            self._contact_sensor_state = new_state.state
 
-        # Handle new status
-        if self._switch_state == STATE_ON:
-            await self.handle_button_press()
+            # Handle new status
+            if self._contact_sensor_state == STATE_ON:
+                self.tc.set_position(0)
+                self.async_write_ha_state()
+            elif self._contact_sensor_state == STATE_OFF:
+                # If the contact sensor is off, we can't assume it's 100% open. We need to rely on TravelCalculator.
+                self.async_write_ha_state()
 
     async def handle_button_press(self):
         """Handle the button press logic."""
         if self.tc.is_traveling():
             await self.async_stop_cover()
         else:
-            if self.is_closed() or self._last_command == SERVICE_CLOSE_COVER:
+            if self.is_closed():
                 await self.async_open_cover()
             else:
                 await self.async_close_cover()
@@ -206,6 +233,8 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
     @property
     def is_closed(self):
         """Return if the cover is closed."""
+        if self._contact_sensor_state == STATE_ON:
+            return True
         return self.current_cover_position is None or self.current_cover_position <= 10
 
     @property
@@ -215,11 +244,15 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
 
     async def check_availability(self) -> None:
         """Check if the entity is unavailable and update status."""
-        state = self.hass.states.get(self._switch_entity_id)
-        if state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
-            self._attr_available = False
-        else:
-            self._attr_available = True
+        entities = [self._switch_entity_id]
+        if self._contact_sensor_entity_id:
+            entities.append(self._contact_sensor_entity_id)
+        for entity in entities:
+            state = self.hass.states.get(entity)
+            if state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
+                self._attr_available = False
+                return
+        self._attr_available = True
 
     async def async_set_cover_position(self, **kwargs):
         """Move the cover to a specific position."""
@@ -321,22 +354,69 @@ class CoverTimeBased(CoverEntity, RestoreEntity):
             self.tc.stop()
 
     async def _async_handle_command(self, command, *args):
-        self._last_command = command
+        # Determine the current direction based on the command
+        current_direction = None
         if command == SERVICE_CLOSE_COVER:
-            self._state = False
+            current_direction = "close"
         elif command == SERVICE_OPEN_COVER:
-            self._state = True
+            current_direction = "open"
+
+        if current_direction == "close":
+            if self._previous_direction == "close":
+                # If previous direction was close, press three times
+                # First press should start opening the cover
+                self._state = True
+                await self._press_button()
+                await asyncio.sleep(0.5)  # 500ms delay
+                # Second press should stop the cover
+                self._state = True
+                await self._press_button()
+                await asyncio.sleep(0.5)  # 500ms delay
+                # Third press should start closing the cover again
+                self._state = False
+                await self._press_button()
+            else:
+                # Regular close command
+                self._state = False
+                await self._press_button()
+        elif current_direction == "open":
+            if self._previous_direction == "open":
+                # If previous direction was open, press three times
+                # First press should start closing the cover
+                self._state = False
+                await self._press_button()
+                await asyncio.sleep(0.5)  # 500ms delay
+                # Second press should stop the cover
+                self._state = True
+                await self._press_button()
+                await asyncio.sleep(0.5)  # 500ms delay
+                # Third press should start opening the cover again
+                self._state = True
+                await self._press_button()
+            else:
+                # Regular open command
+                self._state = True
+                await self._press_button()
         elif command == SERVICE_STOP_COVER:
             self._state = True
+            await self._press_button()
 
+        # Update previous_direction only if the direction changes
+        if (
+            current_direction in ["close", "open"]
+            and current_direction != self._previous_direction
+        ):
+            self._previous_direction = current_direction
+
+        _LOGGER.debug("_async_handle_command :: %s", command)
+
+        # Update state of entity
+        self.async_write_ha_state()
+
+    async def _press_button(self):
         await self.hass.services.async_call(
             "homeassistant",
             "turn_on",
             {"entity_id": self._switch_entity_id},
             True,
         )
-
-        _LOGGER.debug("_async_handle_command :: %s", command)
-
-        # Update state of entity
-        self.async_write_ha_state()
