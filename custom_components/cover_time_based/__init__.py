@@ -1,4 +1,5 @@
 """Component to wrap switch entities in entities of other domains."""
+
 from __future__ import annotations
 
 import logging
@@ -15,8 +16,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_entity_registry_updated_event
 
-from .const import CONF_ENTITY_DOWN
-from .const import CONF_ENTITY_UP
+from .const import CONF_ENTITY_SWITCH
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,17 +43,18 @@ def async_add_to_device(
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Check light-swich up and down exist."""
+    """Check that the switch entity exists."""
     registry = er.async_get(hass)
     device_registry = dr.async_get(hass)
     try:
-        for entity in [CONF_ENTITY_UP, CONF_ENTITY_DOWN]:
-            entity_id = er.async_validate_entity_id(registry, entry.options[entity])
+        entity_id = er.async_validate_entity_id(
+            registry, entry.options[CONF_ENTITY_SWITCH]
+        )
     except vol.Invalid:
         # The entity is identified by an unknown entity registry ID
         _LOGGER.error(
             "Failed to setup cover_time_based for unknown entity %s",
-            entry.options[entity],
+            entry.options[CONF_ENTITY_SWITCH],
         )
         return False
 
@@ -119,7 +120,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     registry = er.async_get(hass)
     try:
         switch_entity_id = er.async_validate_entity_id(
-            registry, entry.options[CONF_ENTITY_ID]
+            registry, entry.options[CONF_ENTITY_SWITCH]
         )
     except vol.Invalid:
         # The source entity has been removed from the entity registry

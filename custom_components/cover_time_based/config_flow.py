@@ -1,4 +1,5 @@
 """Config flow for Cover Time-based integration."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -12,8 +13,7 @@ from homeassistant.helpers import selector
 from homeassistant.helpers.schema_config_entry_flow import SchemaConfigFlowHandler
 from homeassistant.helpers.schema_config_entry_flow import SchemaFlowFormStep
 
-from .const import CONF_ENTITY_DOWN
-from .const import CONF_ENTITY_UP
+from .const import CONF_ENTITY_SWITCH
 from .const import CONF_TIME_CLOSE
 from .const import CONF_TIME_OPEN
 from .const import DOMAIN
@@ -23,12 +23,7 @@ CONFIG_FLOW = {
         vol.Schema(
             {
                 vol.Required(CONF_NAME): selector.TextSelector(),
-                vol.Required(CONF_ENTITY_UP): selector.EntitySelector(
-                    selector.EntitySelectorConfig(
-                        domain=[Platform.SWITCH, Platform.LIGHT]
-                    )
-                ),
-                vol.Required(CONF_ENTITY_DOWN): selector.EntitySelector(
+                vol.Required(CONF_ENTITY_SWITCH): selector.EntitySelector(
                     selector.EntitySelectorConfig(
                         domain=[Platform.SWITCH, Platform.LIGHT]
                     )
@@ -97,7 +92,7 @@ class CoverTimeBasedConfigFlowHandler(SchemaConfigFlowHandler, domain=DOMAIN):
         # Hide the wrapped entry if registered
         registry = er.async_get(self.hass)
 
-        for entity in [CONF_ENTITY_UP, CONF_ENTITY_DOWN]:
+        for entity in [CONF_ENTITY_SWITCH]:
             entity_entry = registry.async_get(options[entity])
             if entity_entry is not None and not entity_entry.hidden:
                 registry.async_update_entity(
